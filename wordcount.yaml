@@ -1,0 +1,113 @@
+---
+- name: Install common prerequisites
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Java
+      apt:
+        name: "openjdk-11-jdk"
+        state: present
+
+    - name: Create Spark directory
+      file:
+        path: /opt/spark
+        state: directory
+        mode: '0755'
+
+    - name: Download and extract Spark
+      unarchive:
+        src: "https://dlcdn.apache.org/spark/spark-3.5.4/spark-3.5.4-bin-hadoop3.tgz"
+        dest: /opt/spark
+        remote_src: yes
+        creates: "/opt/spark/spark-3.5.4-bin-hadoop3"
+        extra_opts: "--strip-components=1"
+
+    - name: Set SPARK_HOME
+      lineinfile:
+        path: /etc/profile.d/spark.sh
+        create: yes
+        line: 'export SPARK_HOME=/opt/spark'
+        state: present
+
+    - name: Add Spark to PATH
+      lineinfile:
+        path: /etc/profile.d/spark.sh
+        line: 'export PATH=$PATH:$SPARK_HOME/bin:$SPARK_HOME/sbin'
+        state: present
+
+- name: Configure Spark Master
+  hosts: spark_master
+  become: yes
+  tasks:
+    - name: Create Spark master configuration
+      template:
+        src: spark-master.conf.j2
+        dest: /opt/spark/conf/spark-master.conf
+        mode: '0644'
+
+    - name: Stop existing Spark master
+      shell: |
+        source /etc/profile.d/spark.sh
+        /opt/spark/sbin/stop-master.sh
+      ignore_errors: yes
+      
+    - name: Pause to insure shudown
+      pause:
+        seconds: 5
+
+    - name: Wait for process to stop
+      wait_for:
+        path: "/proc/{{ item }}/status"
+        state: absent
+      ignore_errors: yes
+      with_items: "{{ ansible_facts.proc_cmdline | select('match', '.org.apache.spark.deploy.master.Master.') | list }}"
+
+    - name: Start Spark Master
+      shell: |
+        source /etc/profile.d/spark.sh
+        /opt/spark/sbin/start-master.sh
+      args:
+        executable: /bin/bash
+
+    - name: Wait for master to be ready
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 7077
+        timeout: 30
+
+- name: Configure Spark Workers
+  hosts: spark_workers
+  become: yes
+  tasks:
+    - name: Create Spark worker configuration
+      template:
+        src: spark-worker.conf.j2
+        dest: /opt/spark/conf/spark-worker.conf
+        mode: '0644'
+
+    - name: Stop existing Spark workers
+      shell: |
+        source /etc/profile.d/spark.sh
+        /opt/spark/sbin/stop-worker.sh
+      ignore_errors: yes
+      register: kill_out
+      failed_when: false
+
+    - name: Wait for worker processes to stop
+      wait_for:
+        path: "/proc/{{ item }}/status"
+        state: absent
+      ignore_errors: yes
+      with_items: "{{ ansible_facts.proc_cmdline | select('match', '.org.apache.spark.deploy.worker.Worker.') | list }}"
+
+    - name: Start Spark Workers
+      shell: |
+        source /etc/profile.d/spark.sh
+        export SPARK_LOCAL_IP={{ ansible_host }}
+        /opt/spark/sbin/start-worker.sh spark://{{ hostvars[groups['spark_master'][0]]['ansible_host'] }}:7077
+      args:
+        executable: /bin/bash
